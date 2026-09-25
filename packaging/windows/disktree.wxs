@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The Windows installer: a per-user MSI, so it needs no administrator and
+  installs the way per-user apps do, into %LOCALAPPDATA%\Programs.
+
+  It puts disktree.exe there, adds a Start menu shortcut, and appends the
+  folder to the user's PATH so `disktree C:\some\dir` works in a terminal.
+  Uninstalling from Settings takes all three back. A newer version
+  replaces an older one in place.
+
+  Built by the release workflow:
+
+    wix build packaging/windows/disktree.wxs -arch x64
+      -ext WixToolset.UI.wixext
+      -d Version=0.9.1 -d Exe=target/release/disktree.exe
+      -d Icon=assets/disktree.ico -d License=packaging/windows/License.rtf
+      -o disktree-0.9.1-x86_64-windows.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="disktree"
+           Manufacturer="disktree contributors"
+           Version="$(Version)"
+           Scope="perUser"
+           Compressed="yes"
+           UpgradeCode="7BE71376-0458-439C-85F5-E66B7A6BE624">
+    <!-- Keep this code for good: it is how a new version finds the old. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of disktree is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="disktree.ico" SourceFile="$(Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="disktree.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/menzew-org/disktree" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/menzew-org/disktree/issues" />
+
+    <!-- A license page, then Install: enough UI to see it happen. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(License)" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="disktree" />
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      Per-user components keep their key path in HKCU and remove the
+      folders they create, which is what Windows Installer requires of
+      anything installed into a user profile.
+    -->
+    <!-- A fixed GUID: a file with a registry key path gets none generated. -->
+    <Component Id="Program" Directory="INSTALLFOLDER"
+               Guid="3F6D0A52-9B1E-4C7A-8E25-6B0D4F1C9A73">
+      <File Id="disktree.exe" Source="$(Exe)" />
+      <RegistryValue Root="HKCU" Key="Software\disktree" Name="Installed"
+                     Type="integer" Value="1" KeyPath="yes" />
+      <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]"
+                   Part="last" Action="set" System="no" Permanent="no" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <!-- Only when empty: other apps live in Programs too. -->
+      <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+    </Component>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenu">
+        <Shortcut Id="StartMenuShortcut" Name="disktree"
+                  Description="See what fills your disk, and free it up"
+                  Target="[INSTALLFOLDER]disktree.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="disktree.ico" />
+        <RegistryValue Root="HKCU" Key="Software\disktree" Name="StartMenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="disktree">
+      <ComponentRef Id="Program" />
+      <ComponentRef Id="StartMenu" />
+    </Feature>
+  </Package>
+</Wix>

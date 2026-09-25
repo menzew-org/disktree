@@ -27,10 +27,38 @@ This is a fork of [tobi/disktree](https://github.com/tobi/disktree). It adds:
 
 ## Install
 
-Download `disktree-*-x86_64-linux.tar.gz` from the
-[latest release](https://github.com/menzew-org/disktree/releases/latest), unpack
-it, and run `./install.sh` inside (or just copy `disktree` onto your
-`PATH`). Or build it:
+Everything is on the
+[latest release](https://github.com/menzew-org/disktree/releases/latest),
+with a SHA-256 checksum beside each file.
+
+### Windows 10 and 11
+
+Download `disktree-<version>-x86_64-windows.msi` and open it. It installs
+for your account only, with no administrator prompt: the program goes to
+`%LOCALAPPDATA%\Programs\disktree`, a **disktree** shortcut appears in the
+Start menu, and `disktree` works in a new terminal. Remove it from
+**Settings → Apps → Installed apps**; installing a newer version replaces
+the old one.
+
+Until releases are code-signed, SmartScreen may say *Windows protected your
+PC* the first time: choose **More info → Run anyway**. The checksum next to
+the download lets you confirm it is the file the release built.
+
+Prefer not to install? `disktree-<version>-x86_64-windows.zip` holds the
+same `disktree.exe`; unpack it anywhere and run it.
+
+For the fast whole-drive scan, start it as administrator: right-click the
+Start menu shortcut → **Run as administrator**. See
+[On Windows](#on-windows).
+
+### Linux (Omarchy and other Wayland or X11 desktops)
+
+Download `disktree-<version>-x86_64-linux.tar.gz`, unpack it, and run
+`./install.sh` inside (or just copy `disktree` onto your `PATH`).
+
+### From source
+
+You need Rust 1.97 or newer. On Linux:
 
 ```sh
 git clone https://github.com/menzew-org/disktree
@@ -50,20 +78,27 @@ make install
 `sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
 removes exactly what was installed.
 
-You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
-can drive (Vulkan).
+It needs a Wayland or X11 session with a GPU that GPUI can drive (Vulkan).
 
-On Windows, download `disktree-*-x86_64-windows.zip`, unpack it, and run
-`install.ps1` inside (see [On Windows](#on-windows)), or build it with
-`cargo build --release` and use `target\release\disktree.exe`.
+On Windows, install [Rust](https://rustup.rs) and Visual Studio's build
+tools (*Desktop development with C++*), then:
+
+```powershell
+git clone https://github.com/menzew-org/disktree
+cd disktree
+cargo build --release   # target\release\disktree.exe
+```
 
 ## Use
 
+Open **disktree** from the Start menu or your launcher: it scans your home
+folder. From a terminal:
+
 ```sh
-disktree            # scan the home directory
-disktree --disk     # the whole disk it lives on
-disktree ~/src      # or any directory
-disktree --help     # options: apparent size, follow links, skip hidden, …
+disktree              # scan your home folder
+disktree --disk       # the whole disk it is on: / on Linux, C:\ on Windows
+disktree ~/src        # or any folder; on Windows, e.g. disktree D:\Projects
+disktree --help       # every option: apparent size, skip hidden, …
 ```
 
 ### The screen
@@ -241,20 +276,8 @@ windowrule = size 1400 900, class:^(disktree)$
 
 ## On Windows
 
-disktree runs on Windows 10 and 11 too. Install a release for your user,
-with no administrator rights:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1            # install
-powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
-```
-
-That copies `disktree.exe` to `%LOCALAPPDATA%\Programs\disktree`, adds a
-Start menu shortcut and puts the directory on your `PATH`. Building needs
-Rust 1.97 and the MSVC build tools (Visual Studio's *Desktop development
-with C++*).
-
-What is different there:
+disktree runs on Windows 10 and 11; see [Install](#windows-10-and-11).
+Everything above applies, and so do the keys. What is different there:
 
 - **The home directory** is your profile, `C:\Users\you`. `--disk` and `g`
   scan the drive it is on, `C:\`.
@@ -296,6 +319,10 @@ make test     # scanner, layout and removal tests, plus window-harness tests
 make ci       # lint, then test
 ```
 
+On Windows, where there is no `make`, the same gates run through Cargo:
+`cargo xtask lint`, `cargo xtask test`, `cargo xtask ci`. `cargo xtask icon`
+renders `assets/disktree.svg` into the `.ico` built into `disktree.exe`.
+
 The lint gate is strict on purpose: `clippy::all` and `clippy::pedantic` are
 errors, and every exception is written down with its reason in `Cargo.toml`.
 The window-harness tests draw real frames and press real keys — including one
@@ -310,7 +337,8 @@ gone while their neighbours are not.
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |
 | `crates/disktree-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
 | `crates/disktree-app/src/tests.rs` | end-to-end tests through a real window |
-| `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |
+| `crates/disktree-core/src/mft.rs` | reading an NTFS drive from its file table |
+| `packaging/`, `assets/`, `Makefile` | the desktop entry, the Windows installer (`packaging/windows`), the icons, and install |
 
 The interface follows the
 [GPUI Kit design guides](https://gpui-kit.com/versions/main/docs/design-guides/):

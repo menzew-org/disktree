@@ -6,6 +6,8 @@
 //! anything: it reports the diff and fails, so a red local run is the same
 //! signal CI gives.
 
+mod icon;
+
 use std::process::{Command, ExitCode, Stdio};
 
 const USAGE: &str = "\
@@ -18,6 +20,7 @@ tasks:
   clippy    clippy --workspace --all-targets -- -D warnings
   test      cargo test --workspace
   ci        lint, then test
+  icon      render assets/disktree.svg into assets/disktree.ico (Windows)
 ";
 
 fn main() -> ExitCode {
@@ -31,6 +34,7 @@ fn main() -> ExitCode {
         "clippy" => clippy(),
         "test" => test(),
         "ci" => fmt(false).and_then(|()| clippy()).and_then(|()| test()),
+        "icon" => icon::render(),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

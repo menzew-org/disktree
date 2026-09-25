@@ -92,6 +92,11 @@ jobs:
     # After the Linux job, which creates the release this uploads into.
     needs: release
     runs-on: windows-2025
+    env:
+      # Secrets cannot be tested in `if:`; these can. Each step below that
+      # needs one is skipped cleanly when it is not configured.
+      HAS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+      HAS_VIRUSTOTAL: ${{ secrets.VIRUSTOTAL_API_KEY != '' }}
     defaults:
       run:
         shell: bash
@@ -107,6 +112,7 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=disktree-$version-x86_64-windows" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -117,24 +123,94 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+      # The exe carries its icon and version information (build.rs) and
+      # GPUI's manifest. Nothing is packed or obfuscated: a plain, described
+      # binary is what antivirus engines have least reason to doubt.
       - name: Build
         run: cargo build --release --locked -p disktree-app
 
-      - name: Package
-        id: package
+      # Authenticode signing, when a certificate is configured: the
+      # WINDOWS_CERTIFICATE secret is a base64 PFX, with its password in
+      # WINDOWS_CERTIFICATE_PASSWORD. Signed with a timestamp, so the
+      # signature outlives the certificate.
+      - name: Sign the program
+        if: env.HAS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          name="disktree-${{ steps.version.outputs.version }}-x86_64-windows"
+          $pfx = Join-Path $env:RUNNER_TEMP signing.pfx
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERTIFICATE))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool sign /f $pfx /p $env:PASSWORD /fd sha256 `
+            /tr http://timestamp.digicert.com /td sha256 `
+            /d disktree target\release\disktree.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item $pfx
+
+      - name: Installer
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          mkdir -p dist
+          wix build packaging/windows/disktree.wxs -arch x64 \
+            -ext WixToolset.UI.wixext \
+            -d Version=${{ steps.version.outputs.version }} \
+            -d Exe=target/release/disktree.exe \
+            -d Icon=assets/disktree.ico \
+            -d License=packaging/windows/License.rtf \
+            -o "dist/${{ steps.version.outputs.name }}.msi"
+
+      - name: Sign the installer
+        if: env.HAS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP signing.pfx
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERTIFICATE))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool sign /f $pfx /p $env:PASSWORD /fd sha256 `
+            /tr http://timestamp.digicert.com /td sha256 `
+            /d disktree "dist\${{ steps.version.outputs.name }}.msi"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item $pfx
+
+      # The same program, for running without installing.
+      - name: Portable zip
+        run: |
+          name="${{ steps.version.outputs.name }}"
           mkdir -p "dist/$name"
-          cp target/release/disktree.exe packaging/install.ps1 \
-             README.md LICENSE "dist/$name/"
-          echo "${{ steps.version.outputs.version }}" > "dist/$name/VERSION"
+          cp target/release/disktree.exe README.md LICENSE "dist/$name/"
           (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
+          (cd dist && sha256sum "$name.msi" > "$name.msi.sha256")
           (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
-          echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          NAME: ${{ steps.version.outputs.name }}
+        run: |
+          gh release upload "$TAG" --clobber \
+            "dist/$NAME.msi" "dist/$NAME.msi.sha256" \
+            "dist/$NAME.zip" "dist/$NAME.zip.sha256"
+
+      # Scan what was published and link each report in the release notes,
+      # so anyone can check before downloading. Needs a VirusTotal API key
+      # (a free account is enough) in VIRUSTOTAL_API_KEY.
+      - name: VirusTotal
+        if: env.HAS_VIRUSTOTAL == 'true'
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VIRUSTOTAL_API_KEY }}
+          github_token: ${{ github.token }}
+          update_release_body: true
+          request_rate: 4
+          files: |
+            dist/${{ steps.version.outputs.name }}.msi
+            dist/${{ steps.version.outputs.name }}.zip

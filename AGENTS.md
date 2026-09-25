@@ -42,6 +42,15 @@ never `HOME`, and canonicalize through `paths::canonical`, which drops the
 `\\?\` prefix so paths still compare with the home directory. The one
 `unsafe` block is `AttachConsole` in `main.rs`.
 
+Releases ship a per-user MSI (`packaging/windows/disktree.wxs`, WiX 5) and
+a portable zip. `build.rs` embeds the icon and version information; GPUI
+embeds the manifest, so never add one. The icon is rendered from
+`assets/disktree.svg` by `cargo xtask icon` — rerun it when the SVG
+changes. Keep the binary plain: no packers (UPX and the like) and no
+script launchers, which is what antivirus heuristics flag. The release
+signs when `WINDOWS_CERTIFICATE` is set and links VirusTotal reports when
+`VIRUSTOTAL_API_KEY` is.
+
 ## House rules
 
 * **Strict lints from omatrack's style.** `clippy::all` and `clippy::pedantic`
