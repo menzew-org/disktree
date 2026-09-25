@@ -23,9 +23,10 @@ mod windows {
             .set("ProductName", "disktree")
             .set("FileDescription", "disktree: see what fills your disk")
             .set("CompanyName", "disktree contributors")
+            // As LICENSE has it.
             .set(
                 "LegalCopyright",
-                "MIT License. Copyright (c) Tobi L\u{fc}tke and contributors",
+                "Copyright (c) 2026 Tobi L\u{fc}tke, (c) 2026 menzew. MIT.",
             )
             .set("OriginalFilename", "disktree.exe")
             .set("InternalName", "disktree");
