@@ -943,9 +943,11 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     });
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
-    // The trail runs from "/", and the scanned root sits under its parents.
+    // The trail runs from "/" (or the drive, `C:\`), and the scanned root
+    // sits under its parents.
     let trail = read(&view, cx, Disktree::breadcrumbs);
-    assert_eq!(trail[0].0, "/");
+    let top = temp.path().ancestors().last().expect("a filesystem root");
+    assert_eq!(trail[0].0, top.to_string_lossy());
     assert!(
         trail.contains(&(
             temp.path()
@@ -1164,4 +1166,212 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     // Unmarking the directory unmarks everything.
     update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
     assert!(read(&view, cx, |app| app.marks.is_empty()));
+}
+
+/// The last scan shows at once, removal waits for the fresh walk, and the
+/// fresh tree takes over with the selection still on the same path.
+#[gpui_kit::test]
+fn a_cached_scan_shows_first_and_the_fresh_one_replaces_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cache = tempfile::TempDir::new().expect("cache dir");
+    let before = scan(temp.path(), options()).expect("scan");
+    let saved_at = crate::state::now_seconds() - 7_200;
+    disktree_core::cache::save(
+        cache.path(),
+        temp.path(),
+        &options(),
+        &before,
+        saved_at,
+    )
+    .expect("save");
+    // Written after the cache: only the fresh walk can know about it.
+    std::fs::write(temp.path().join("keep/late.bin"), vec![0_u8; 4096])
+        .expect("write");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.scan_cache = Some(cache.path().to_path_buf());
+        app.start_scan(cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.cached_at), Some(saved_at));
+    let cached_files = read(&view, cx, |app| app.tree().map(|t| t.files));
+    assert_eq!(cached_files, Some(before.files), "the cached tree is shown");
+
+    // Select junk, then mark it: the review may not commit a cached size.
+    let junk = temp.path().join("junk");
+    update(&view, cx, |app, cx| {
+        app.selected = app.crumbs_for_path(&junk);
+        app.toggle_mark_selected(cx);
+        app.commit(cx);
+    });
+    assert!(read(&view, cx, |app| {
+        app.screen != Screen::Running
+            && app
+                .notice
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("still checking"))
+    }));
+
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    for _ in 0..600 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let landed = update(&view, cx, |app, cx| {
+            app.poll_scan_once(epoch, cx);
+            app.cached_at.is_none()
+        });
+        if landed {
+            break;
+        }
+    }
+    draw(cx);
+    let (files, selected) = read(&view, cx, |app| {
+        (
+            app.tree().map(|t| t.files),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.path_at(crumbs)),
+        )
+    });
+    assert_eq!(files, Some(before.files + 1), "the fresh walk saw late.bin");
+    assert_eq!(selected.as_deref(), Some(junk.as_path()), "same path kept");
+
+    cx.run_until_parked();
+    let rewritten =
+        disktree_core::cache::load(cache.path(), temp.path(), &options())
+            .expect("load")
+            .expect("the fresh scan was cached");
+    assert!(rewritten.saved_at > saved_at);
+    assert_eq!(rewritten.tree.files, before.files + 1);
+}
+
+fn click(cx: &mut Window, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is drawn"));
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+    // The pick is computed off the UI thread.
+    cx.run_until_parked();
+    draw(cx);
+}
+
+/// A legend entry is a switch: the mosaic shows only that kind of data,
+/// the row says how much of it is here, and a second click lets go.
+#[gpui_kit::test]
+fn a_legend_entry_narrows_the_mosaic_to_its_kind(cx: &mut TestAppContext) {
+    use crate::state::Pick;
+    use disktree_core::classify::Category;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    click(cx, "legend-Cache");
+    let (pick, applied, here, selected) = read(&view, cx, |app| {
+        (
+            app.pick,
+            app.filter_applied,
+            app.picked_here(),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.node_at(crumbs))
+                .map(|node| node.name.to_string()),
+        )
+    });
+    assert_eq!(pick, Some(Pick::Category(Category::Cache)));
+    assert!(applied, "the mosaic is narrowed, not just dimmed");
+    assert_eq!(here, Some((300_000, 1)), "only .cache is cache here");
+    assert_eq!(selected.as_deref(), Some(".cache"));
+    let tiles = update(&view, cx, |app, _| {
+        app.layout().map(<[Tile]>::to_vec).unwrap_or_default()
+    });
+    let names = read(&view, cx, |app| {
+        tiles
+            .iter()
+            .filter_map(|tile| app.node_at(tile.crumbs()))
+            .map(|node| node.name.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(names.contains(&".cache".to_string()), "{names:?}");
+    assert!(!names.contains(&"junk".to_string()), "{names:?}");
+
+    click(cx, "legend-Cache");
+    assert_eq!(read(&view, cx, |app| app.pick), None, "clicked again: all");
+    assert!(!read(&view, cx, |app| app.filter_applied));
+
+    click(cx, "legend-Reclaimable");
+    assert_eq!(read(&view, cx, |app| app.pick), Some(Pick::Reclaimable));
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.pick), None, "escape lets go");
+}
+
+/// Picking what the scan has none of says so and leaves the view alone,
+/// rather than showing an empty mosaic.
+#[gpui_kit::test]
+fn picking_something_absent_says_so(cx: &mut TestAppContext) {
+    use crate::state::Pick;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    // Everything in the fixture was written just now; nothing is older.
+    let older = Pick::Age(crate::palette::AGE_BUCKETS.len() - 1);
+    update(&view, cx, |app, cx| app.toggle_pick(older, cx));
+    cx.run_until_parked();
+    draw(cx);
+    let (pick, applied, notice) = read(&view, cx, |app| {
+        (app.pick, app.filter_applied, app.notice.clone())
+    });
+    assert_eq!(pick, None);
+    assert!(!applied);
+    assert!(
+        notice.is_some_and(|(text, _)| text.contains("older")),
+        "the notice names the pick"
+    );
+}
+
+/// Kind names what a file is, not the category it inherited; a folder's
+/// age is its bytes spread over the Age bands.
+#[gpui_kit::test]
+fn the_panel_says_what_a_file_is_and_how_old_a_folder_is(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::classify::{Category, Reclaim};
+    use disktree_core::tree::{Node, NodeKind};
+
+    let mut jar = Node::entry("guava-33.0.jar", NodeKind::File, 10);
+    jar.category = Category::Cache;
+    jar.reclaim = Some(Reclaim::Regenerable);
+    assert_eq!(
+        crate::views::kind_of(&jar),
+        format!("Java archive \u{00b7} {}", Reclaim::Regenerable.label())
+    );
+    let mut folder = Node::directory("repository");
+    folder.category = Category::Cache;
+    assert_eq!(crate::views::kind_of(&folder), "Cache");
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let junk = read(&view, cx, |app| {
+        app.tree()
+            .and_then(|tree| {
+                tree.children.iter().position(|c| &*c.name == "junk")
+            })
+            .expect("junk")
+    });
+    update(&view, cx, |app, cx| app.select(Some(vec![junk]), cx));
+    draw(cx);
+    let profile =
+        read(&view, cx, |app| app.age_profile_at(&[junk])).expect("a profile");
+    assert_eq!(profile.total(), 300_000);
+    assert_eq!(profile.bytes[0], 300_000, "written this week");
+    assert!(profile.oldest > 0 && profile.oldest <= profile.newest);
 }

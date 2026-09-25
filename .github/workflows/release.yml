@@ -86,3 +86,55 @@ jobs:
             gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
               --title "disktree ${TAG#v}" --generate-notes
           fi
+
+  windows:
+    name: Build and publish (Windows)
+    # After the Linux job, which creates the release this uploads into.
+    needs: release
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Version
+        id: version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
+
+      - name: Build
+        run: cargo build --release --locked -p disktree-app
+
+      - name: Package
+        id: package
+        run: |
+          name="disktree-${{ steps.version.outputs.version }}-x86_64-windows"
+          mkdir -p "dist/$name"
+          cp target/release/disktree.exe packaging/install.ps1 \
+             README.md LICENSE "dist/$name/"
+          echo "${{ steps.version.outputs.version }}" > "dist/$name/VERSION"
+          (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber

@@ -4,13 +4,13 @@
 //! decisions — what is selected, what a mark means, what a key does, when to
 //! re-scan — live here so they can be reasoned about in one place.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use disktree_core::filter::{Keep, Matches, filter};
+use disktree_core::filter::{Keep, Matches, Query, filter, filter_query};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
@@ -20,7 +20,7 @@ use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{
     SpaceInfo, device_for, space_info, volume_root_for,
 };
-use disktree_core::tree::{Metric, Node, path_of};
+use disktree_core::tree::{AgeProfile, Metric, Node, age_profile, path_of};
 use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
@@ -45,6 +45,50 @@ pub enum ColorMode {
     Kind,
     /// How long since anything in it was written.
     Age,
+}
+
+/// A legend chip picked to narrow the mosaic to one kind of data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    Category(disktree_core::classify::Category),
+    Reclaimable,
+    /// An index into [`crate::palette::AGE_BUCKETS`].
+    Age(usize),
+}
+
+impl Pick {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Category(category) => category.label(),
+            Self::Reclaimable => "Reclaimable",
+            Self::Age(band) => crate::palette::AGE_BUCKETS
+                .get(band)
+                .map_or("", |(_, label)| label),
+        }
+    }
+
+    /// The filter it runs, with ages measured from `now`: the same bands,
+    /// from the same moment, the tiles are coloured by.
+    fn query(self, now: i64) -> Query {
+        match self {
+            Self::Category(category) => Query::Category(category),
+            Self::Reclaimable => Query::Reclaimable,
+            Self::Age(band) => {
+                let bands = crate::palette::AGE_BUCKETS;
+                let through =
+                    bands.get(band).map_or(i64::MAX, |(days, _)| *days);
+                let after = band
+                    .checked_sub(1)
+                    .and_then(|previous| bands.get(previous))
+                    .map_or(-1, |(days, _)| *days);
+                Query::Age {
+                    now,
+                    after,
+                    through,
+                }
+            }
+        }
+    }
 }
 
 /// A trail crumb's sibling menu, open.
@@ -405,6 +449,18 @@ pub struct Disktree {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
+    /// Where finished scans are kept, to show at once next time. `None`
+    /// turns the cache off, as the tests do.
+    pub scan_cache: Option<PathBuf>,
+    /// The tree on screen came from the cache, written at this Unix time;
+    /// the fresh walk is still running and will replace it.
+    pub cached_at: Option<i64>,
+    /// The legend chip narrowing the mosaic, if one is picked. Its matches
+    /// live in `matches`, over the whole tree, so it holds as you move.
+    pub pick: Option<Pick>,
+    /// The age profile of the last node asked about, by its crumbs: the
+    /// panel asks every frame, and a big folder is a million files to add.
+    age_memo: RefCell<Option<(usize, Vec<usize>, AgeProfile)>>,
 }
 
 impl Disktree {
@@ -414,7 +470,7 @@ impl Disktree {
         depth: u32,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = disktree_core::paths::home_dir();
         let space = space_info(&root_path).ok();
         let trash_backend = detect_trash_backend();
         let mut tree = Self {
@@ -484,6 +540,16 @@ impl Disktree {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
+            // The tests leave the user's real cache alone; the one that
+            // exercises the cache points this at a temporary directory.
+            scan_cache: if cfg!(test) {
+                None
+            } else {
+                disktree_core::cache::default_dir()
+            },
+            cached_at: None,
+            pick: None,
+            age_memo: RefCell::new(None),
         };
         tree.device = device_for(&tree.root_path);
         tree.disk_root = tree
@@ -534,7 +600,10 @@ impl Disktree {
     /// where it is reached, so only what is new at the wider level is read,
     /// and the current view stays on screen until the wider tree lands.
     pub fn widen_to(&mut self, above: PathBuf, cx: &mut Context<'_, Self>) {
-        let Some(tree) = self.tree.clone() else {
+        // A cached tree is the last run's: reusing it would pass stale sizes
+        // off as measured, so widening from one walks everything.
+        let tree = self.tree.clone().filter(|_| self.cached_at.is_none());
+        let Some(tree) = tree else {
             self.set_root(above, cx);
             return;
         };
@@ -644,12 +713,89 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&self.root_path);
+        self.cached_at = None;
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
             self.options.clone(),
         ));
+        self.load_cached(epoch, cx);
         Self::poll_scan(epoch, cx);
         cx.notify();
+    }
+
+    /// Read the last finished scan of this root off the UI thread, and show
+    /// it until the walk that just started lands.
+    fn load_cached(&self, epoch: u64, cx: &Context<'_, Self>) {
+        let Some(dir) = self.scan_cache.clone() else {
+            return;
+        };
+        if !disktree_core::cache::cacheable(&self.options) {
+            return;
+        }
+        let root = self.root_path.clone();
+        let options = self.options.clone();
+        // A missing, damaged or foreign cache is simply not shown.
+        let task = cx.background_executor().spawn(async move {
+            disktree_core::cache::load(&dir, &root, &options)
+                .ok()
+                .flatten()
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(cached) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.show_cached(epoch, cached, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Put a cached tree on screen, unless the walk it stands in for has
+    /// already landed or been replaced.
+    pub(crate) fn show_cached(
+        &mut self,
+        epoch: u64,
+        cached: disktree_core::cache::Cached,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if epoch != self.scan_epoch
+            || self.tree.is_some()
+            || self.scan.is_none()
+        {
+            return;
+        }
+        self.marks
+            .refresh(&self.root_path, &cached.tree, self.options.metric);
+        self.tree = Some(Arc::new(cached.tree));
+        self.cached_at = Some(cached.saved_at);
+        self.cache = None;
+        self.refresh_insights();
+        self.select_largest(cx);
+        cx.notify();
+    }
+
+    /// Keep a finished scan for next time, off the UI thread.
+    fn save_to_cache(&self, tree: &Arc<Node>, cx: &Context<'_, Self>) {
+        let Some(dir) = self.scan_cache.clone() else {
+            return;
+        };
+        if !disktree_core::cache::cacheable(&self.options) {
+            return;
+        }
+        let root = self.root_path.clone();
+        let options = self.options.clone();
+        let tree = Arc::clone(tree);
+        let saved_at = now_seconds();
+        // Losing the cache costs one slow start, so a failure is not worth
+        // interrupting anyone for.
+        cx.background_executor()
+            .spawn(async move {
+                let _ = disktree_core::cache::save(
+                    &dir, &root, &options, &tree, saved_at,
+                );
+            })
+            .detach();
     }
 
     fn poll_scan(epoch: u64, cx: &Context<'_, Self>) {
@@ -700,13 +846,43 @@ impl Disktree {
                     self.space = space_info(&self.root_path).ok();
                     self.device = device_for(&self.root_path);
                 }
+                // Replacing a cached tree: crumbs are positions, and the
+                // fresh tree may be ordered differently, so carry the view
+                // and the selection across by path.
+                let carried = self.cached_at.take().map(|_| {
+                    let view = self.path_at(&self.crumbs);
+                    let selected = self
+                        .selected
+                        .clone()
+                        .and_then(|crumbs| self.path_at(&crumbs));
+                    (view, selected)
+                });
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
-                self.tree = Some(Arc::new(node));
+                let tree = Arc::new(node);
+                self.save_to_cache(&tree, cx);
+                self.tree = Some(tree);
                 self.cache = None;
                 self.refresh_insights();
                 self.scan_elapsed =
                     self.scan_started.map(|started| started.elapsed());
+                if let Some((view, selected)) = carried {
+                    // Matches are positions in the cached tree; a pick is
+                    // asked again of the fresh one, and a typed filter
+                    // lapses.
+                    let pick = self.pick;
+                    self.clear_filter();
+                    if let Some(pick) = pick {
+                        self.run_pick(pick, cx);
+                    }
+                    self.crumbs = view
+                        .and_then(|path| self.crumbs_for_path(&path))
+                        .unwrap_or_default();
+                    self.selected =
+                        selected.and_then(|path| self.crumbs_for_path(&path));
+                    self.forget_hover();
+                    self.transition = None;
+                }
                 if let Some(from) = came_from {
                     let crumbs = self.crumbs_for_path(&from);
                     self.crumbs.clear();
@@ -1389,12 +1565,14 @@ impl Disktree {
                 TileKind::Others { .. } => None,
             };
             let category = node.map_or_else(Default::default, |n| n.category);
-            let age_bucket = (age && node.is_some_and(|n| n.modified > 0))
-                .then(|| {
-                    let days =
-                        (now - node.map_or(now, |n| n.modified)) / 86_400;
-                    crate::palette::age_bucket(days)
-                });
+            let age_bucket = (age
+                && node.is_some_and(|n| {
+                    disktree_core::tree::known_time(n.modified)
+                }))
+            .then(|| {
+                let days = (now - node.map_or(now, |n| n.modified)) / 86_400;
+                crate::palette::age_bucket(days)
+            });
             let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
             {
                 None | Some(Some(Keep::Whole)) => Filtered::Shown,
@@ -1438,6 +1616,17 @@ impl Disktree {
                     let Some(node) = self.node_at(crumbs) else {
                         continue;
                     };
+                    // Narrowed, a tile is drawn at what it holds of the
+                    // filter, and says that number rather than its whole.
+                    let value = self
+                        .matches
+                        .as_deref()
+                        .filter(|_| self.filter_applied)
+                        .and_then(|matches| matches.keep(crumbs))
+                        .map_or_else(
+                            || node.value(metric),
+                            |keep| Matches::value(keep, node, metric),
+                        );
                     labels.push(Label {
                         text: node.name.to_string(),
                         rect: self.animated_rect(tile.rect),
@@ -1447,7 +1636,7 @@ impl Disktree {
                         depth: tile.depth,
                         dim: filtered == Filtered::Out,
                         marked: is_marked || is_covered,
-                        size_text: crate::widgets::short_value(node, metric),
+                        size_text: crate::widgets::short_amount(value, metric),
                     });
                 }
                 TileKind::Others { count, .. } => labels.push(Label {
@@ -1644,9 +1833,14 @@ impl Disktree {
                 metric,
             );
         }
-        // Children are ordered by the metric, so every crumb moved.
+        // Children are ordered by the metric, so every crumb moved: a
+        // typed filter lapses, a pick is asked again.
         self.refresh_insights();
+        let pick = self.pick;
         self.clear_filter();
+        if let Some(pick) = pick {
+            self.run_pick(pick, cx);
+        }
         self.cache = None;
         cx.notify();
     }
@@ -1681,6 +1875,18 @@ impl Disktree {
     /// a permanent deletion, which cannot be undone.
     pub fn commit(&mut self, cx: &mut Context<'_, Self>) {
         if self.plan().is_empty() {
+            return;
+        }
+        // The sizes on screen are from the last run; the review promises
+        // what comes back, so it waits for the walk to confirm them.
+        if self.cached_at.is_some() {
+            self.notice = Some((
+                "still checking the disk: removal opens when the scan \
+                 lands"
+                    .into(),
+                Status::Warning,
+            ));
+            cx.notify();
             return;
         }
         match self.removal_mode {
@@ -1850,6 +2056,8 @@ impl Disktree {
     /// milliseconds to search, and typing must not wait for it. Each
     /// keystroke supersedes the search before it.
     pub fn refresh_matches(&mut self, cx: &Context<'_, Self>) {
+        // Typing a name replaces a legend pick; the two do not combine.
+        self.pick = None;
         self.find_epoch += 1;
         let epoch = self.find_epoch;
         let needle = self.find.clone();
@@ -1926,8 +2134,126 @@ impl Disktree {
         cx.notify();
     }
 
+    /// A legend chip was clicked: show only that kind of data, or stop
+    /// when it is already the one shown.
+    ///
+    /// Computed over the whole tree, off the UI thread, so the pick holds
+    /// while you go in and out of directories.
+    pub fn toggle_pick(&mut self, pick: Pick, cx: &mut Context<'_, Self>) {
+        let again = self.pick == Some(pick);
+        self.clear_filter();
+        if !again {
+            self.run_pick(pick, cx);
+        }
+        cx.notify();
+    }
+
+    fn run_pick(&mut self, pick: Pick, cx: &Context<'_, Self>) {
+        let Some(tree) = self.tree.clone() else {
+            return;
+        };
+        self.pick = Some(pick);
+        self.find_epoch += 1;
+        let epoch = self.find_epoch;
+        self.finding = true;
+        let query = pick.query(self.scanned_at);
+        let task = cx.background_executor().spawn(async move {
+            filter_query(&tree, &[], query, pick.label())
+        });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.find_epoch {
+                    return;
+                }
+                this.finding = false;
+                this.matches = Some(Arc::new(found));
+                this.apply_pick(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Lay out only what was picked, with the largest of it in the
+    /// directory on screen selected.
+    fn apply_pick(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(matches) = self.matches.clone() else {
+            return;
+        };
+        // An empty mosaic would look broken; say so and change nothing.
+        if matches.count == 0 {
+            let label = matches.needle.to_lowercase();
+            self.clear_filter();
+            self.notice = Some((
+                format!("nothing in this scan is {label}"),
+                Status::Neutral,
+            ));
+            cx.notify();
+            return;
+        }
+        self.filter_applied = true;
+        self.filter_epoch += 1;
+        self.view = View::IDENTITY;
+        self.transition = None;
+        self.forget_hover();
+        self.pointer_active = false;
+        let metric = self.options.metric;
+        let largest = self.current().and_then(|node| {
+            node.children
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let mut crumbs = self.crumbs.clone();
+                    crumbs.push(index);
+                    let keep = matches.keep(&crumbs)?;
+                    Some((Matches::value(keep, child, metric), crumbs))
+                })
+                .max_by_key(|(value, _)| *value)
+                .map(|(_, crumbs)| crumbs)
+        });
+        self.selected = largest;
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// What the pick holds in the directory on screen: bytes and files.
+    pub fn picked_here(&self) -> Option<(u64, u64)> {
+        let matches =
+            self.matches.as_deref().filter(|_| self.pick.is_some())?;
+        let current = self.current()?;
+        match matches.keep(&self.crumbs)? {
+            Keep::Whole => Some((current.bytes, current.files)),
+            Keep::Partial { bytes, files } => Some((bytes, files)),
+        }
+    }
+
+    /// How old the bytes at `crumbs` are, spread over the age bands the
+    /// Age colouring uses. Remembered for the last node asked about.
+    pub fn age_profile_at(&self, crumbs: &[usize]) -> Option<AgeProfile> {
+        let tree = self.tree.as_ref()?;
+        // The tree's address tells one scan from the next.
+        let identity = Arc::as_ptr(tree) as usize;
+        if let Some((cached_tree, cached_crumbs, profile)) =
+            self.age_memo.borrow().as_ref()
+            && *cached_tree == identity
+            && cached_crumbs.as_slice() == crumbs
+        {
+            return Some(profile.clone());
+        }
+        let node = tree.resolve(crumbs)?;
+        let limits: Vec<i64> = crate::palette::AGE_BUCKETS
+            .iter()
+            .map(|(days, _)| *days)
+            .collect();
+        let profile = age_profile(node, self.scanned_at, &limits);
+        *self.age_memo.borrow_mut() =
+            Some((identity, crumbs.to_vec(), profile.clone()));
+        Some(profile)
+    }
+
     /// Drop the find text and the filter with it.
     pub fn clear_filter(&mut self) {
+        self.pick = None;
         self.find_epoch += 1;
         self.finding = false;
         self.apply_pending = false;

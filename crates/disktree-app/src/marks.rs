@@ -113,7 +113,15 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
         .and_then(|home| path.strip_prefix(home).ok().map(|rest| (home, rest)))
     {
         Some((_, rest)) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some((_, rest)) => format!("~/{}", rest.display()),
+        // Rebuilt from components, so a path spelled with `/` on Windows
+        // still reads `~\a\b` there, like every other path on screen.
+        Some((_, rest)) => {
+            rest.components().fold(String::from("~"), |mut out, part| {
+                out.push(std::path::MAIN_SEPARATOR);
+                out.push_str(&part.as_os_str().to_string_lossy());
+                out
+            })
+        }
         None => path.display().to_string(),
     }
 }
@@ -222,7 +230,7 @@ mod tests {
         let home = Path::new("/home/tobi");
         assert_eq!(
             display_path(Path::new("/home/tobi/.cache/npm"), Some(home)),
-            "~/.cache/npm"
+            format!("~{0}.cache{0}npm", std::path::MAIN_SEPARATOR)
         );
         assert_eq!(display_path(home, Some(home)), "~");
         assert_eq!(display_path(Path::new("/var/log"), Some(home)), "/var/log");

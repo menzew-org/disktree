@@ -20,6 +20,10 @@ disktree-core = { workspace = true }
 anyhow = { workspace = true }
 rustc-hash = { workspace = true }
 
+# Only to reattach a release build to the terminal it was started from.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 # The window harness: it lets the tests draw a real frame and press real keys.
 gpui-kit = { version = "=0.6.1", default-features = false, features = [

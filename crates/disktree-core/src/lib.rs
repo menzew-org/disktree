@@ -5,12 +5,18 @@
 //! hardlink de-duplication, aspect-ratio layout, and what may be deleted — can
 //! be built and tested without GPUI, a display, or a GPU.
 
+pub mod cache;
 pub mod classify;
+pub mod filetype;
 pub mod filter;
 pub mod insights;
+pub mod mft;
+pub mod paths;
 pub mod removal;
 pub mod scan;
 pub mod size;
 pub mod space;
+#[cfg(test)]
+mod test_support;
 pub mod tree;
 pub mod treemap;

@@ -5,6 +5,11 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+// A release build on Windows is a GUI program, so launching it from the
+// Start menu does not open a console window next to it. Debug builds keep
+// the console for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod git;
 mod marks;
 mod palette;
@@ -52,10 +57,14 @@ options:
                         filesystems mounted below PATH (off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 3)
       --metric files    rank by file count instead of bytes
+  -W, --walk            Windows: always walk the directories, never read the
+                        NTFS file table (read by default for a whole drive
+                        or the home directory, when run as administrator)
   -h, --help            show this help
 ";
 
 fn main() -> Result<()> {
+    attach_parent_console();
     let args = parse_args()?;
     let root = args.root.clone();
     let depth = args.depth;
@@ -82,8 +91,7 @@ fn main() -> Result<()> {
                                     "disktree · {}",
                                     marks::display_path(
                                         &title_root,
-                                        std::env::var_os("HOME")
-                                            .map(PathBuf::from)
+                                        disktree_core::paths::home_dir()
                                             .as_deref(),
                                     )
                                 )
@@ -120,6 +128,28 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A GUI-subsystem program starts without a console, so `--help` and
+/// argument errors would vanish when it is run from a terminal. Borrow the
+/// terminal's console when there is one; from the Start menu there is none
+/// and nothing changes.
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "AttachConsole is a plain Win32 call with no pointers; it has \
+              no safe wrapper"
+)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole,
+    };
+    // SAFETY: takes a process id by value and touches no Rust memory. A
+    // failure only means there is no parent console, which is fine.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+const fn attach_parent_console() {}
+
 fn parse_args() -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
@@ -140,6 +170,9 @@ fn parse_args() -> Result<Args> {
             // old invocations still work.
             "-x" | "--one-filesystem" => options.one_filesystem = true,
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
+            "-W" | "--walk" => {
+                options.file_table = disktree_core::scan::FileTable::Never;
+            }
             "-D" | "--disk" => disk = true,
             "-d" | "--depth" => {
                 let value = args.next().context("--depth needs a number")?;
@@ -173,21 +206,20 @@ fn parse_args() -> Result<Args> {
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = disktree_core::paths::home_dir();
     let root = match root {
+        // `/` on Unix; on Windows the top of the current drive.
         _ if disk => home
             .as_deref()
             .and_then(disktree_core::space::volume_root_for)
-            .unwrap_or_else(|| PathBuf::from("/")),
+            .unwrap_or_else(|| PathBuf::from(std::path::MAIN_SEPARATOR_STR)),
         Some(root) => root,
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("no path given and HOME is not set")?,
+        None => home.context("no path given and no home directory is set")?,
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
     // Canonical, so a later widening recognises this tree in the wider walk.
-    let root = root.canonicalize().unwrap_or(root);
+    let root = disktree_core::paths::canonical(&root);
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());

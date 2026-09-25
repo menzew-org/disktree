@@ -15,15 +15,25 @@ Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
 Omarchy theme and behaves like the rest of the desktop.
 
+This is a fork of [tobi/disktree](https://github.com/tobi/disktree). It adds:
+
+- **Windows.** The same app on Windows 10 and 11, with the Recycle Bin, and
+  run as administrator, whole-drive scans read straight from the NTFS file
+  table — see [On Windows](#on-windows).
+- **An instant start.** The last scan is on screen at once while a fresh one
+  runs.
+- **A legend you can click** to see only one kind of data or one age, a
+  **Kind** that names what a file is, and the **age** of a folder's bytes.
+
 ## Install
 
 Download `disktree-*-x86_64-linux.tar.gz` from the
-[latest release](https://github.com/tobi/disktree/releases/latest), unpack
+[latest release](https://github.com/menzew-org/disktree/releases/latest), unpack
 it, and run `./install.sh` inside (or just copy `disktree` onto your
 `PATH`). Or build it:
 
 ```sh
-git clone https://github.com/tobi/disktree
+git clone https://github.com/menzew-org/disktree
 cd disktree
 make install
 ```
@@ -43,6 +53,10 @@ removes exactly what was installed.
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan).
 
+On Windows, download `disktree-*-x86_64-windows.zip`, unpack it, and run
+`install.ps1` inside (see [On Windows](#on-windows)), or build it with
+`cargo build --release` and use `target\release\disktree.exe`.
+
 ## Use
 
 ```sh
@@ -61,6 +75,12 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   the scanned root a crumb is dimmer, and clicking it widens the scan to
   there (see below).
 - **Under it:** the scan totals, the filter when one is typed, and the legend.
+  Every legend entry is a switch: click **Code**, **Cache** or
+  **Reclaimable** — or, in **Age** mode, **Older** — and the mosaic shows
+  only that, at its true size, where it lives, with how much of it is in
+  the directory on screen. It stays on as you go in and out; click it again
+  or press `esc` to see everything. Categories are judged file by file, so
+  **Code** leaves out the `node_modules` inside a checkout.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back
@@ -68,12 +88,17 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   colour. Top-level directories carry a strip of their colour and a name
   band; deeper open directories a slim label row. In **Age** mode colour is
   the last write instead, from this week to older.
-- **Panel:** the selection (its size set large, share of the scan, files,
-  last write, and for a checkout what git says — changes, stashes, unpushed
-  commits); *Worth a look*, the largest things that could plausibly go;
-  what is marked; and the disk, free now and after the marks, with the way
-  to the review screen. Drag its left edge to resize it; double-click the
-  edge to reset.
+- **Panel:** the selection — its size set large, share of the scan, files,
+  and its kind: for a file, what it is (*Java archive*, not the colour of
+  the folder it sits in); for a checkout, what git says (changes, stashes,
+  unpushed commits). A file shows its last write; a folder its newest
+  write and how its bytes spread over the age bands — *70 % last written
+  over a year ago · oldest 4 years ago* — since a big folder's newest write
+  is nearly always today. Then *Worth a look*, the largest things that
+  could plausibly go; what is marked; and the disk, free now and after the
+  marks, with the way to the review screen. Drag its left edge to resize
+  it; double-click the edge to reset. Hovering a tile shows its size, age
+  and, for a file, what it is.
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.
@@ -153,6 +178,11 @@ commits, `esc` goes back.
 - **Hardlinks once.** Two names for one inode cost one file.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
+- **The last scan first.** Every finished scan is kept (in `~/.cache/disktree`,
+  or `%LOCALAPPDATA%\disktree\cache` on Windows), so the next start shows
+  it at once — the status bar says how old it is — while a fresh scan
+  runs and replaces it, keeping your place. Removal waits for the fresh
+  one: it promises what comes back, so it will not act on old sizes.
 
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
@@ -208,6 +238,54 @@ It is designed for a roomy window; float it, or give it a rule:
 windowrule = float, class:^(disktree)$
 windowrule = size 1400 900, class:^(disktree)$
 ```
+
+## On Windows
+
+disktree runs on Windows 10 and 11 too. Install a release for your user,
+with no administrator rights:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1            # install
+powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+```
+
+That copies `disktree.exe` to `%LOCALAPPDATA%\Programs\disktree`, adds a
+Start menu shortcut and puts the directory on your `PATH`. Building needs
+Rust 1.97 and the MSVC build tools (Visual Studio's *Desktop development
+with C++*).
+
+What is different there:
+
+- **The home directory** is your profile, `C:\Users\you`. `--disk` and `g`
+  scan the drive it is on, `C:\`.
+- **Move to trash** uses the Recycle Bin, the same one File Explorer uses.
+- **Run it as administrator for fast scans.** A whole drive, or your home
+  folder, is then read straight from the NTFS file table (`$MFT`) rather
+  than walked folder by folder — on a 500 GB drive with two million files,
+  14 seconds instead of two minutes. The status bar says *from the file
+  table*; without the rights it says *run as administrator to scan
+  faster* and walks as before. Folders below your home are small enough
+  that walking them is quicker, so they are always walked. `--walk` turns
+  the file table off.
+- **Sizes** from the file table are what each file really occupies —
+  compressed, sparse and OneDrive-placeholder files count at what they
+  cost — and hardlinks are charged once. A walk cannot learn either
+  without opening every file, so it counts the apparent length and every
+  hardlink in full: Windows itself hardlinks `C:\Windows\WinSxS` into
+  `System32`, so a walked whole-drive scan can total more than the drive
+  holds. Your profile is not affected.
+- **NTFS's own files** — `$MFT`, `$LogFile`, `$Extend` — appear at the top
+  of a whole-drive scan read from the file table, because they are real
+  space. Like everything at the top of a drive whose name starts with `$`,
+  they cannot be removed.
+- **Junctions and links are not followed**, like symlinks elsewhere. That
+  also keeps a scan off volumes mounted in a folder.
+- **Refused:** `C:\Windows`, `Program Files` and `Program Files (x86)`, and
+  what Windows keeps at the top of every drive — `$Recycle.Bin`,
+  `System Volume Information`, `Recovery` and the page, swap and
+  hibernation files. Matching ignores case, as Windows does.
+- **The theme** is gpui-omarchy's default; there is no Omarchy theme to
+  follow.
 
 ## Develop
 

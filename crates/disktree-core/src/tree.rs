@@ -250,7 +250,10 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     let mut modified = 0;
     for child in &mut node.children {
         aggregate(child, metric);
-        modified = modified.max(child.modified);
+        // A placeholder stamp would pass for the folder's newest write.
+        if known_time(child.modified) {
+            modified = modified.max(child.modified);
+        }
         bytes += child.bytes;
         files += child.files;
         dirs += child.dirs;
@@ -276,6 +279,76 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     });
 }
 
+/// Whether a write time, in Unix seconds, says when the file was written.
+///
+/// Tools that build reproducibly stamp every file with a fixed date: zip's
+/// epoch of 1980 or thereabouts, the Unix epoch, and npm's 1985-10-26
+/// 08:15:00 for everything it unpacks. Those files were put there recently,
+/// and counting them as decades old would fill the oldest age band with
+/// fresh installs. Such times are treated as unknown.
+pub const fn known_time(seconds: i64) -> bool {
+    /// 1980-01-02: a day past the zip epoch, to allow for time zones.
+    const ZIP_EPOCH: i64 = 315_619_200;
+    /// npm's fixed stamp for unpacked package files.
+    const NPM_STAMP: i64 = 499_162_500;
+    seconds > ZIP_EPOCH && seconds != NPM_STAMP
+}
+
+/// How old the bytes in a subtree are.
+///
+/// A directory's `modified` is its newest write, which for anything large
+/// is nearly always "just now" and says little about the rest; this says
+/// how the bytes spread over time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgeProfile {
+    /// Bytes last written within each band given to [`age_profile`],
+    /// youngest first. Files with no known write time are left out.
+    pub bytes: Vec<u64>,
+    /// Oldest and newest write among the files, Unix seconds; `0` when
+    /// no file has a known one.
+    pub oldest: i64,
+    pub newest: i64,
+}
+
+impl AgeProfile {
+    pub fn total(&self) -> u64 {
+        self.bytes.iter().sum()
+    }
+}
+
+/// Spread `node`'s file bytes over age bands: `limits` are each band's
+/// upper bound in days, youngest first; anything older falls in the last.
+pub fn age_profile(node: &Node, now: i64, limits: &[i64]) -> AgeProfile {
+    let mut profile = AgeProfile {
+        bytes: vec![0; limits.len()],
+        ..AgeProfile::default()
+    };
+    let last = limits.len().saturating_sub(1);
+    // A stack, not recursion: a whole disk is millions of nodes deep in
+    // places, and this runs on the UI thread for the selection.
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.is_dir() {
+            stack.extend(node.children.iter());
+            continue;
+        }
+        if !known_time(node.modified) || limits.is_empty() {
+            continue;
+        }
+        let days = (now - node.modified).max(0) / 86_400;
+        let band = limits
+            .iter()
+            .position(|limit| days <= *limit)
+            .unwrap_or(last);
+        profile.bytes[band] += node.bytes;
+        if profile.oldest == 0 || node.modified < profile.oldest {
+            profile.oldest = node.modified;
+        }
+        profile.newest = profile.newest.max(node.modified);
+    }
+    profile
+}
+
 /// Absolute path of the node at `crumbs` beneath a scanned root.
 pub fn path_of(root_path: &Path, root: &Node, crumbs: &[usize]) -> PathBuf {
     let mut path = root_path.to_path_buf();
@@ -298,6 +371,54 @@ mod tests {
 
     fn leaf(name: &str, bytes: u64) -> Node {
         Node::entry(name, NodeKind::File, bytes)
+    }
+
+    #[test]
+    fn placeholder_stamps_are_not_write_times() {
+        assert!(!known_time(0), "never set");
+        assert!(!known_time(1), "SOURCE_DATE_EPOCH=1");
+        assert!(!known_time(315_532_800), "the zip epoch, 1980-01-01");
+        assert!(!known_time(499_162_500), "npm's 1985-10-26 08:15");
+        assert!(known_time(499_162_501));
+        assert!(known_time(1_700_000_000), "2023");
+
+        // A folder of only stamped files has no newest write to claim.
+        let mut stamped = leaf("index.js", 10);
+        stamped.modified = 499_162_500;
+        let mut package = Node::directory("left-pad");
+        package.children.push(stamped);
+        aggregate(&mut package, Metric::Bytes);
+        assert_eq!(package.modified, 0);
+    }
+
+    #[test]
+    fn an_age_profile_spreads_bytes_over_their_last_writes() {
+        const DAY: i64 = 86_400;
+        // Mid-2024, well clear of the placeholder stamps.
+        let now = 19_900 * DAY;
+        let written = |name, bytes, days_ago: i64| {
+            let mut node = leaf(name, bytes);
+            node.modified = now - days_ago * DAY;
+            node
+        };
+        let mut root = Node::directory("root");
+        let mut old = Node::directory("old");
+        old.children.push(written("ancient.iso", 700, 800));
+        old.children.push(written("last-year.zip", 200, 200));
+        root.children.push(old);
+        root.children.push(written("today.txt", 100, 0));
+        root.children.push(leaf("unknown.bin", 50));
+        aggregate(&mut root, Metric::Bytes);
+
+        let profile = age_profile(&root, now, &[7, 365, i64::MAX]);
+        assert_eq!(profile.bytes, vec![100, 200, 700]);
+        assert_eq!(profile.total(), 1000, "no write time, not counted");
+        assert_eq!(profile.oldest, now - 800 * DAY);
+        assert_eq!(profile.newest, now);
+
+        let file = written("one", 5, 30);
+        let single = age_profile(&file, now, &[7, 365, i64::MAX]);
+        assert_eq!(single.bytes, vec![0, 5, 0], "a file is its own profile");
     }
 
     #[test]

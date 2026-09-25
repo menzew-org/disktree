@@ -18,7 +18,9 @@
 use std::fs::{self, DirEntry, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
@@ -57,6 +59,32 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
+    /// On Windows, whether to read an NTFS volume's file table instead of
+    /// walking it, where the rights allow. See [`crate::mft`].
+    pub file_table: FileTable,
+}
+
+/// When a scan reads the volume's file table instead of walking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileTable {
+    /// Where it pays: see [`file_table_pays`].
+    #[default]
+    Auto,
+    /// Always walk.
+    Never,
+    /// Whatever the root; for tests and for asking on purpose.
+    Always,
+}
+
+/// Whether reading the file table beats walking `root`.
+///
+/// Reading the table costs the same however little of it is wanted —
+/// seconds on a big volume — where a walk costs what it reads. So it pays
+/// where the walk is slow: a whole drive, and the home directory or
+/// anything holding it. Anything below walks, and is quick to.
+pub fn file_table_pays(root: &Path) -> bool {
+    root.parent().is_none()
+        || crate::paths::home_dir().is_some_and(|home| home.starts_with(root))
 }
 
 impl Default for ScanOptions {
@@ -69,6 +97,37 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
+            file_table: FileTable::Auto,
+        }
+    }
+}
+
+/// How a scan reads the tree, so the interface can say so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Engine {
+    /// One directory listing at a time, in parallel.
+    #[default]
+    Walk,
+    /// The whole NTFS file table, read front to back. See [`crate::mft`].
+    FileTable,
+    /// Walking, because reading the file table needs administrator rights.
+    WalkWithoutAdmin,
+}
+
+impl Engine {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Walk => 0,
+            Self::FileTable => 1,
+            Self::WalkWithoutAdmin => 2,
+        }
+    }
+
+    const fn decode(value: u8) -> Self {
+        match value {
+            1 => Self::FileTable,
+            2 => Self::WalkWithoutAdmin,
+            _ => Self::Walk,
         }
     }
 }
@@ -87,6 +146,7 @@ pub struct ScanProgress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
+    engine: AtomicU8,
 }
 
 /// A point-in-time view of [`ScanProgress`].
@@ -100,15 +160,17 @@ pub struct ScanSnapshot {
     pub cancelled: bool,
     /// Up to [`MAX_ERROR_DETAIL`] unreadable paths, most recent last.
     pub messages: Vec<String>,
+    /// How the tree is being read.
+    pub engine: Engine,
 }
 
 impl ScanProgress {
-    fn count_file(&self, bytes: u64) {
+    pub(crate) fn count_file(&self, bytes: u64) {
         self.files.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn count_dir(&self) {
+    pub(crate) fn count_dir(&self) {
         self.dirs.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -124,6 +186,26 @@ impl ScanProgress {
 
     fn finish(&self) {
         self.finished.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only Windows has a second engine")
+    )]
+    fn set_engine(&self, engine: Engine) {
+        self.engine.store(engine.encode(), Ordering::Relaxed);
+    }
+
+    /// Forget what an abandoned attempt counted, before the walk counts
+    /// again.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only Windows has a second engine")
+    )]
+    fn reset_counts(&self) {
+        self.files.store(0, Ordering::Relaxed);
+        self.dirs.store(0, Ordering::Relaxed);
+        self.bytes.store(0, Ordering::Relaxed);
     }
 
     /// Ask the walk to stop at the next directory boundary.
@@ -145,6 +227,7 @@ impl ScanProgress {
             finished: self.finished.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
             messages: lock(&self.messages).clone(),
+            engine: Engine::decode(self.engine.load(Ordering::Relaxed)),
         }
     }
 }
@@ -381,7 +464,7 @@ impl WalkContext {
         };
 
         if meta.is_dir() {
-            if let Some(key) = file_identity(&meta)
+            if let Some(key) = directory_identity(path, &meta)
                 && !lock(&self.visited_dirs).insert(key)
             {
                 return Classified::Skipped;
@@ -478,6 +561,10 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             format!("{} is not a directory", root.display()),
         ));
     }
+    #[cfg(windows)]
+    if let Some(node) = scan_file_table(root, context) {
+        return Ok(node);
+    }
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -486,7 +573,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         }
     }
     if context.options.follow_links
-        && let Some(key) = file_identity(&root_meta)
+        && let Some(key) = directory_identity(root, &root_meta)
     {
         lock(&context.visited_dirs).insert(key);
     }
@@ -580,6 +667,45 @@ fn signal_done(dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
     signal_done(&parent, context);
 }
 
+/// Read `root` from its volume's file table where that works: an NTFS
+/// drive, an administrator, links not followed (the table knows where a
+/// link points only as a string). `None` means walk instead, having undone
+/// whatever the attempt counted.
+#[cfg(windows)]
+fn scan_file_table(root: &Path, context: &WalkContext) -> Option<Node> {
+    let wanted = match context.options.file_table {
+        FileTable::Never => false,
+        FileTable::Auto => file_table_pays(root),
+        FileTable::Always => true,
+    };
+    if !wanted || context.options.follow_links {
+        return None;
+    }
+    let progress = &context.progress;
+    match crate::mft::scan(root, &context.options, progress) {
+        Ok(node) => {
+            progress.set_engine(Engine::FileTable);
+            Some(finish_tree(node, &context.options))
+        }
+        Err(error) => {
+            progress.reset_counts();
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                progress.set_engine(Engine::WalkWithoutAdmin);
+            }
+            None
+        }
+    }
+}
+
+/// The name a scanned root is shown under.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "the file table is Windows-only")
+)]
+pub(crate) fn root_name(path: &Path) -> Box<str> {
+    file_name(path)
+}
+
 /// Charge a hardlinked file once, then derive every aggregate from the result.
 ///
 /// Zeroing `own_bytes` rather than `bytes` is deliberate:
@@ -654,7 +780,7 @@ fn allocated_bytes(meta: &Metadata) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
+const fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
     None
 }
 
@@ -665,7 +791,7 @@ fn device_of(meta: &Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn device_of(_meta: &Metadata) -> u64 {
+const fn device_of(_meta: &Metadata) -> u64 {
     0
 }
 
@@ -683,8 +809,26 @@ fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(unix))]
-fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
+const fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
     None
+}
+
+/// A key for a directory reached through a followed link, so the walk
+/// enters it once. The inode where there is one; elsewhere a hash of where
+/// the link finally leads, which only followed links and the root pay for.
+#[cfg(unix)]
+fn directory_identity(_path: &Path, meta: &Metadata) -> Option<(u64, u64)> {
+    file_identity(meta)
+}
+
+#[cfg(not(unix))]
+fn directory_identity(path: &Path, _meta: &Metadata) -> Option<(u64, u64)> {
+    use std::hash::{Hash as _, Hasher as _};
+    let target = fs::canonicalize(path).ok()?;
+    let mut hasher = rustc_hash::FxHasher::default();
+    // Windows paths are case-insensitive: one directory, one key.
+    target.to_string_lossy().to_lowercase().hash(&mut hasher);
+    Some((0, hasher.finish()))
 }
 
 fn kind_of(meta: &Metadata, file_type: fs::FileType) -> NodeKind {
@@ -796,6 +940,9 @@ mod tests {
         assert_eq!(tree.files, 2);
     }
 
+    // Windows file IDs need a handle per file, so hardlinks are not
+    // de-duplicated there; see `file_identity`.
+    #[cfg(unix)]
     #[test]
     fn hardlinks_are_charged_once_by_default() {
         let temp = TempDir::new().expect("tempdir");
@@ -845,8 +992,7 @@ mod tests {
         write(outside.path(), "elsewhere.bin", 5000);
         let root = temp.path();
         write(root, "real.bin", 100);
-        std::os::unix::fs::symlink(outside.path(), root.join("link"))
-            .expect("symlink");
+        crate::test_support::link_dir(outside.path(), &root.join("link"));
 
         let tree = scan_dir(root, &options());
         // Only the real file's bytes; the link itself holds just its target
@@ -862,8 +1008,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path();
         write(root, "sub/leaf.bin", 42);
-        std::os::unix::fs::symlink(root, root.join("sub/loop"))
-            .expect("symlink");
+        crate::test_support::link_dir(root, &root.join("sub").join("loop"));
 
         let tree = scan_dir(
             root,
@@ -927,6 +1072,8 @@ mod tests {
         assert_eq!(by_files.children[0].files, 5);
     }
 
+    // Permission bits are how a test locks a directory; Windows uses ACLs.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_recorded_not_fatal() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1034,13 +1181,72 @@ mod tests {
         assert_eq!(tree.files, known.files + 1);
     }
 
+    /// The file table and the walk agree on a real tree written a moment
+    /// ago. The table path needs rights to read the raw volume — an
+    /// administrator, as on CI — and without them there is nothing to
+    /// compare, so the test says so and passes.
+    #[cfg(windows)]
+    #[test]
+    fn the_file_table_agrees_with_the_walk() {
+        fn names(node: &Node, prefix: &str, out: &mut Vec<String>) {
+            for child in &node.children {
+                let path = format!("{prefix}/{}", child.name);
+                out.push(format!("{path} {:?}", child.kind));
+                names(child, &path, out);
+            }
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("tempdir");
+        // Long names, as the table stores them, not a short-name TEMP.
+        let root = crate::paths::canonical(temp.path());
+        write(&root, "a.bin", 10_000);
+        write(&root, "sub/b.bin", 70_000);
+        write(&root, ".hidden/c.bin", 3_000);
+        fs::hard_link(root.join("a.bin"), root.join("sub").join("again.bin"))
+            .expect("hardlink");
+        crate::test_support::link_dir(outside.path(), &root.join("link"));
+
+        let with = |file_table| ScanOptions {
+            apparent_size: true,
+            file_table,
+            ..options()
+        };
+        let progress = Arc::new(ScanProgress::default());
+        let context = Arc::new(WalkContext {
+            known: None,
+            options: with(FileTable::Always),
+            progress: Arc::clone(&progress),
+            root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
+            visited_dirs: Mutex::new(FxHashSet::default()),
+            root: Mutex::new(None),
+        });
+        let table = scan_blocking(&root, &context).expect("scan");
+        if progress.snapshot().engine != Engine::FileTable {
+            eprintln!("not elevated: the file table was not compared");
+            return;
+        }
+        let walk = scan(&root, with(FileTable::Never)).expect("walk");
+        let (mut seen_by_table, mut seen_by_walk) = (Vec::new(), Vec::new());
+        names(&table, "", &mut seen_by_table);
+        names(&walk, "", &mut seen_by_walk);
+        seen_by_table.sort();
+        seen_by_walk.sort();
+        assert_eq!(seen_by_table, seen_by_walk, "the same entries");
+        assert_eq!(table.files, walk.files);
+        assert_eq!(child(&table, "link").kind, NodeKind::Symlink);
+        // The walk cannot see a hardlink on Windows and counts it twice.
+        assert_eq!(table.bytes, walk.bytes - 10_000, "the hardlink once");
+    }
+
     /// A real whole-disk scan, run by hand: `cargo test -p disktree-core
     /// -- --ignored --nocapture whole_disk`. Prints what it found, so the
     /// volume rules can be checked against this machine's mounts.
     #[test]
     #[ignore = "walks the whole disk"]
     fn whole_disk_smoke() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let home = crate::paths::home_dir().expect("a home directory");
         let root = crate::space::volume_root_for(&home).expect("a volume root");
         let started = std::time::Instant::now();
         let tree = scan(&root, ScanOptions::default()).expect("scan");

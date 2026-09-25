@@ -5,7 +5,7 @@
 
 use disktree_core::size::{human_bytes, human_bytes_short, share, share_bar};
 use disktree_core::space::SpaceInfo;
-use disktree_core::tree::{Metric, Node};
+use disktree_core::tree::Metric;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
@@ -27,11 +27,11 @@ pub fn human_count(value: u64) -> String {
     disktree_core::size::human_count(value)
 }
 
-/// The value to show for a node under the active metric.
-pub fn short_value(node: &Node, metric: Metric) -> String {
+/// An amount of the active metric, short: `1.5GiB`, or a file count.
+pub fn short_amount(value: u64, metric: Metric) -> String {
     match metric {
-        Metric::Bytes => human_bytes_short(node.bytes),
-        Metric::Files => human_count(node.files),
+        Metric::Bytes => human_bytes_short(value),
+        Metric::Files => human_count(value),
     }
 }
 
@@ -383,7 +383,7 @@ pub fn split_size(text: &str) -> (String, String) {
 
 /// How long ago a Unix time was, in the unit a person would use.
 pub fn ago(now: i64, then: i64) -> String {
-    if then <= 0 {
+    if !disktree_core::tree::known_time(then) {
         return "unknown".to_string();
     }
     let seconds = (now - then).max(0);
@@ -405,6 +405,27 @@ pub fn ago(now: i64, then: i64) -> String {
 }
 
 /// A thin bar: `fraction` of a track, in `color`.
+/// A thin bar cut into `parts`, each as wide as its share of the whole and
+/// in its own colour: how a folder's bytes spread over ages.
+pub fn stacked_bar(parts: &[(u64, Hsla)], cx: &App) -> Div {
+    let theme = cx.omarchy();
+    let total = parts.iter().map(|(value, _)| *value).sum::<u64>().max(1);
+    div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .h(crate::ui::size::METER)
+        .bg(theme.foreground.opacity(0.08))
+        .children(parts.iter().filter(|(value, _)| *value > 0).map(
+            |(value, color)| {
+                div()
+                    .h_full()
+                    .w(relative(*value as f32 / total as f32))
+                    .bg(*color)
+            },
+        ))
+}
+
 pub fn bar(fraction: f32, color: Hsla, cx: &App) -> Div {
     let theme = cx.omarchy();
     div()

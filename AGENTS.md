@@ -33,6 +33,15 @@ entry's `Categories` to a single main category plus additional ones, or
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.
 
+## Windows
+
+It also builds and runs on Windows (MSVC). Platform code is `cfg(unix)` /
+`cfg(windows)` arms next to each other, never a separate module tree, and CI
+lints and tests both. Read the home directory through `paths::home_dir`,
+never `HOME`, and canonicalize through `paths::canonical`, which drops the
+`\\?\` prefix so paths still compare with the home directory. The one
+`unsafe` block is `AttachConsole` in `main.rs`.
+
 ## House rules
 
 * **Strict lints from omatrack's style.** `clippy::all` and `clippy::pedantic`
@@ -54,7 +63,11 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
 ## Invariants
 
 1. **Sizes come from `st_blocks * 512` unless apparent size was asked for.**
-   That is the number that comes back when a file is deleted.
+   That is the number that comes back when a file is deleted. On Windows
+   the file table (`mft.rs`) gives the same: the clusters each stream's
+   runs occupy, and one record per hardlinked file. A Windows walk cannot
+   see either without opening every file, so there it is the apparent
+   length and hardlinks count in full; the README says so.
 2. **`own_bytes`/`own_files` are derived, never tracked.** `tree::aggregate`
    computes the totals from the children. Hardlink de-duplication rewrites a
    leaf's weight and re-aggregates; anything that patches `bytes` directly will
@@ -78,6 +91,14 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
    from marked bytes; the final number comes from `statvfs` before and after.
+10. **The file table is only a faster way to the same tree.** Anything that
+    stops it — no administrator, not NTFS, a record it cannot parse — is an
+    error `scan` answers by walking. Its parser works on byte slices with
+    every offset checked and is tested against records built byte by byte;
+    `the_file_table_agrees_with_the_walk` compares both on a real tree when
+    run elevated, as CI's Windows runner is.
+11. **A cached tree is shown, never acted on.** It stands in while the fresh
+    scan runs; removal waits, and widening does not reuse it.
 
 ## Where changes belong
 
@@ -88,6 +109,11 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
+| home, canonical paths, Windows prefixes | `crates/disktree-core/src/paths.rs` |
+| reading NTFS's file table on Windows | `crates/disktree-core/src/mft.rs` |
+| the last scan kept on disk | `crates/disktree-core/src/cache.rs` |
+| what a file is, by its name | `crates/disktree-core/src/filetype.rs` |
+| a legend pick: category, reclaimable, age band | `crates/disktree-core/src/filter.rs` (`Query`) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

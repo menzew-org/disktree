@@ -43,3 +43,24 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+  windows:
+    name: Lint and test (Windows)
+    # Its own job because the platform code only compiles here: clippy on
+    # Linux never sees the `cfg(windows)` half of core and the app.
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo xtask lint
+
+      - name: Test
+        run: cargo xtask test

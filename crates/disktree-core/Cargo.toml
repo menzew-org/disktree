@@ -12,8 +12,20 @@ workspace = true
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rayon = { workspace = true }
-rustix = { version = "1.1", features = ["fs"] }
 rustc-hash = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+# Windows has no statvfs and no XDG trash: free space comes from
+# GetDiskFreeSpaceExW and removal to the Recycle Bin from the shell, both
+# behind safe wrappers so the crate stays free of `unsafe`. The removal
+# worker is a thread of its own, so apartment-threaded COM is safe there.
+[target.'cfg(windows)'.dependencies]
+fs4 = { version = "1.1", default-features = false }
+trash = { version = "5.2", default-features = false, features = [
+    "coinit_apartmentthreaded",
+] }
 
 [dev-dependencies]
 tempfile = "3"

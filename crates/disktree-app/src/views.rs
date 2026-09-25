@@ -7,12 +7,13 @@
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{RemovalMode, Target};
+use disktree_core::scan::Engine;
 use disktree_core::size::human_bytes;
-use disktree_core::tree::Metric;
+use disktree_core::tree::{AgeProfile, Metric, Node, NodeKind};
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
-    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
@@ -27,7 +28,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Pick, Screen, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -742,6 +743,9 @@ fn trail_and_legend(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
+    // While a legend entry is picked, what it holds here takes the totals'
+    // place: it is the number being looked at, and the row has no room for
+    // both beside the legend.
     let mut row = div()
         .flex()
         .flex_row()
@@ -749,8 +753,11 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(scan_totals(app, theme));
-    if app.find_open || !app.find.is_empty() {
+        .child(match app.pick {
+            Some(pick) => pick_summary(app, pick, theme),
+            None => scan_totals(app, theme),
+        });
+    if app.pick.is_none() && (app.find_open || !app.find.is_empty()) {
         row = row.child(find_field(app, theme));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
@@ -787,20 +794,40 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
 }
 
 /// The key to the colours: the categories, or the age ramp in age mode.
+/// Each entry is also a switch: click it to see only that, again to stop.
 /// Clipped from the trailing end when the row runs out of room.
-fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
-    let item = |swatch: Div, label: &'static str| {
+fn legend(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
+    let item = |swatch: Div, pick: Pick| {
+        let label = pick.label();
+        let picked = app.pick == Some(pick);
+        // While something is picked, the rest step back.
+        let quiet = app.pick.is_some() && !picked;
+        let id = format!("legend-{label}");
         div()
+            .id(ElementId::Name(id.clone().into()))
+            .debug_selector(move || id)
             .flex()
             .flex_row()
             .items_center()
             .gap(space::XS)
             .flex_shrink_0()
+            .px(space::XS)
+            .py(space::XXS)
+            .when(picked, |this| this.bg(theme.hover_fill()))
+            .when(quiet, |this| this.opacity(0.45))
+            .hover(|style| style.bg(theme.hover_fill()).opacity(1.0))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_pick(pick, cx);
+            }))
             .child(swatch)
             .child(
                 div()
                     .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
+                    .text_color(if picked {
+                        theme.bright
+                    } else {
+                        theme.secondary
+                    })
                     .child(label),
             )
     };
@@ -812,17 +839,17 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .min_w_0()
         .overflow_hidden();
     if app.color_mode == ColorMode::Age {
-        for (bucket, (_, label)) in palette::AGE_BUCKETS.iter().enumerate() {
+        for bucket in 0..palette::AGE_BUCKETS.len() {
             lane = lane.child(item(
                 widgets::swatch(palette::age_accent(theme, bucket)),
-                label,
+                Pick::Age(bucket),
             ));
         }
     } else {
         for category in Category::LEGEND {
             lane = lane.child(item(
                 widgets::swatch(palette::category_accent(theme, category)),
-                category.label(),
+                Pick::Category(category),
             ));
         }
     }
@@ -835,8 +862,58 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .gap(space::MD)
         .min_w_0()
         .overflow_hidden()
-        .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
+        // While a pick is shown its summary gives way instead, so every
+        // chip, the picked one first of all, stays where it can be clicked.
+        .when(app.pick.is_some(), Styled::flex_shrink_0)
+        .child(item(widgets::hatch_swatch(hatch, ground), Pick::Reclaimable))
         .child(lane)
+}
+
+/// What the picked legend entry holds in the directory on screen, and how
+/// to let go of it.
+fn pick_summary(app: &Disktree, pick: Pick, theme: &Theme) -> Div {
+    let (lead, rest) = if app.finding {
+        (format!("finding {}\u{2026}", pick.label()), String::new())
+    } else {
+        match app.picked_here() {
+            Some((bytes, files)) => (
+                human_bytes(bytes),
+                format!(
+                    "{} here \u{00b7} {} files \u{00b7} esc shows all",
+                    pick.label(),
+                    widgets::human_count(files)
+                ),
+            ),
+            None => (
+                format!("no {} here", pick.label().to_lowercase()),
+                "\u{00b7} esc shows all".to_string(),
+            ),
+        }
+    };
+    // The part of the row that gives way: the chip that was picked has to
+    // stay on screen to be clicked again.
+    div()
+        .flex()
+        .flex_row()
+        .gap(space::SM)
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(text::CAPTION)
+        .text_color(theme.secondary)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme.foreground)
+                .child(lead),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_ellipsis()
+                .overflow_hidden()
+                .child(rest),
+        )
 }
 
 // ── side panel ──────────────────────────────────────────────────────────
@@ -905,6 +982,68 @@ fn side_panel(
 /// What the keys act on: its name and place, its size set large with its
 /// share of the scan, when it was last written, what git says, and the two
 /// things to do with it.
+/// What the selection is. For a folder, the kind of data it holds; for a
+/// file, what the file is — a Java archive in a Maven cache is a Java
+/// archive, and the cache already shows in its colour. Why it could go
+/// follows either way.
+pub fn kind_of(node: &Node) -> String {
+    let what = match node.kind {
+        NodeKind::Directory => node.category.label().to_string(),
+        NodeKind::File => disktree_core::filetype::describe(&node.name),
+        NodeKind::Symlink => "Link".to_string(),
+        NodeKind::Other => "Special file".to_string(),
+    };
+    match node.reclaim {
+        Some(reason) => format!("{what} \u{00b7} {}", reason.label()),
+        None => what,
+    }
+}
+
+/// How [`palette::AGE_BUCKETS`] reads after "last written".
+const WRITTEN: [&str; palette::AGE_BUCKETS.len()] = [
+    "this week",
+    "this month",
+    "in the last six months",
+    "this year",
+    "over a year ago",
+];
+
+/// How old a folder's bytes are: one bar in the Age colours, and the
+/// band most of it is in, with the oldest write.
+fn age_breakdown(profile: &AgeProfile, theme: &Theme, cx: &App) -> Div {
+    let parts: Vec<(u64, Hsla)> = profile
+        .bytes
+        .iter()
+        .enumerate()
+        .map(|(band, bytes)| (*bytes, palette::age_accent(theme, band)))
+        .collect();
+    let (band, largest) = profile
+        .bytes
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|(_, bytes)| *bytes)
+        .unwrap_or_default();
+    let summary = format!(
+        "{} last written {} \u{00b7} oldest {}",
+        widgets::percent(largest, profile.total()),
+        WRITTEN.get(band).copied().unwrap_or_default(),
+        widgets::ago(crate::state::now_seconds(), profile.oldest),
+    );
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(widgets::eyebrow("Age", cx))
+        .child(widgets::stacked_bar(&parts, cx))
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(summary),
+        )
+}
+
 fn selection_section(
     app: &Disktree,
     theme: &Theme,
@@ -1008,13 +1147,7 @@ fn selection_section(
             cx,
         )
     } else {
-        let kind = node.reclaim.map_or_else(
-            || node.category.label().to_string(),
-            |reason| {
-                format!("{} \u{00b7} {}", node.category.label(), reason.label())
-            },
-        );
-        widgets::figure("Kind", kind, theme.bright, cx)
+        widgets::figure("Kind", kind_of(node), theme.bright, cx)
     };
     let grid = div()
         .flex()
@@ -1042,12 +1175,24 @@ fn selection_section(
                 .flex()
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Last write",
+                    // A folder's own time is its newest write inside.
+                    if node.is_dir() {
+                        "Newest write"
+                    } else {
+                        "Last write"
+                    },
                     widgets::ago(crate::state::now_seconds(), node.modified),
                     theme.bright,
                     cx,
                 )))
                 .child(div().flex_1().min_w_0().child(fourth)),
+        )
+        .when_some(
+            node.is_dir()
+                .then(|| app.age_profile_at(&target))
+                .flatten()
+                .filter(|profile| profile.total() > 0),
+            |grid, profile| grid.child(age_breakdown(&profile, theme, cx)),
         );
 
     // Only states that change the decision earn a badge.
@@ -1636,7 +1781,14 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .child(format!("{:.1}\u{00d7}", app.view.scale)),
         );
     }
-    let scan = if app.scan.is_some() {
+    let scan = if let Some(saved_at) = app.cached_at {
+        // A cached tree: say how old it is, and that a fresh one is coming.
+        format!(
+            "showing the scan from {} \u{00b7} rescanning \u{00b7} {} entries",
+            widgets::ago(crate::state::now_seconds(), saved_at),
+            widgets::human_count(app.progress.files),
+        )
+    } else if app.scan.is_some() {
         format!(
             "scanning \u{00b7} {} entries \u{00b7} {}",
             widgets::human_count(app.progress.files),
@@ -1646,8 +1798,17 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         let elapsed = app.scan_elapsed.map_or_else(String::new, |time| {
             format!(" \u{00b7} {:.1} s", time.as_secs_f32())
         });
+        // Say how the tree was read where there was a choice: the file
+        // table, or the walk because the table needs an administrator.
+        let engine = match app.progress.engine {
+            Engine::FileTable => " \u{00b7} from the file table",
+            Engine::WalkWithoutAdmin => {
+                " \u{00b7} run as administrator to scan faster"
+            }
+            Engine::Walk => "",
+        };
         format!(
-            "scan {} entries{elapsed}",
+            "scan {} entries{elapsed}{engine}",
             widgets::human_count(app.progress.files)
         )
     };
@@ -2703,6 +2864,24 @@ pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
                     ),
                     human_bytes(node.own_bytes)
                 )),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child({
+                    let when = widgets::ago(
+                        crate::state::now_seconds(),
+                        node.modified,
+                    );
+                    // The full age breakdown is the panel's; hovering stays
+                    // cheap with just the time.
+                    if node.is_dir() {
+                        format!("newest write {when}")
+                    } else {
+                        format!("{} \u{00b7} written {when}", kind_of(node))
+                    }
+                }),
         );
 
     let mut badges = div().flex().flex_row().gap(space::XS).flex_wrap();

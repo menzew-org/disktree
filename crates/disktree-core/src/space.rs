@@ -49,6 +49,7 @@ impl SpaceInfo {
 }
 
 /// Read the space on the volume containing `path`.
+#[cfg(unix)]
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     let stat = rustix::fs::statvfs(path)?;
     // `f_frsize` is the fragment size the block counts are expressed in;
@@ -66,9 +67,39 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     })
 }
 
+/// Read the space on the volume containing `path`.
+///
+/// `GetDiskFreeSpaceExW` reports the caller's quota as available and the
+/// whole volume's free space as free, the same split as `f_bavail` and
+/// `f_bfree`.
+#[cfg(windows)]
+pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
+    // The call succeeds for any path string whose volume exists, so check
+    // the path itself first: a missing directory must not report a volume.
+    std::fs::metadata(path)?;
+    let stat = fs4::statvfs(path)?;
+    Ok(SpaceInfo {
+        total: stat.total_space(),
+        free: stat.free_space(),
+        available: stat.available_space(),
+    })
+}
+
 /// The device a path's filesystem is mounted from, such as
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
 /// `/proc/self/mounts`. `None` where that table cannot be read.
+///
+/// On Windows the answer is the drive or share, `C:` or `\\host\share`.
+#[cfg(windows)]
+pub fn device_for(path: &Path) -> Option<String> {
+    let root = crate::paths::prefix_root(&crate::paths::canonical(path))?;
+    Some(root.to_string_lossy().trim_end_matches('\\').to_string())
+}
+
+/// The device a path's filesystem is mounted from, such as
+/// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
+/// `/proc/self/mounts`. `None` where that table cannot be read.
+#[cfg(not(windows))]
 pub fn device_for(path: &Path) -> Option<String> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -186,6 +217,16 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 }
 
 /// [`volume_root`] for this machine.
+///
+/// On Windows there is no mount table to read, and the top of the disk is
+/// the drive: `C:\` for anything under `C:\Users`.
+#[cfg(windows)]
+pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
+    crate::paths::prefix_root(&crate::paths::canonical(path))
+}
+
+/// [`volume_root`] for this machine.
+#[cfg(not(windows))]
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -194,6 +235,9 @@ pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
 
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
 /// be read, so the caller can fall back to comparing devices.
+///
+/// Windows has no such table and needs none: a volume mounted in a folder
+/// is a reparse point, which the scan reports as a link and does not enter.
 pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     Some(foreign_mounts(&parse_mounts(&table), root))
